@@ -1,6 +1,6 @@
 # Spark Fundamentals — material do curso
 
-Notebooks Databricks e dataset dos labs do curso **Spark Fundamentals** (OPB School).
+Notebooks Databricks e dataset dos labs do curso **Spark Fundamentals** (DL Treinamentos).
 
 ## Conteúdo
 
