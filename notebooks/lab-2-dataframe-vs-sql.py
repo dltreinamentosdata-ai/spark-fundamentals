@@ -4,10 +4,12 @@
 # MAGIC
 # MAGIC **Fecha o Módulo 2.** A aula 2.2 afirmou: DataFrame API e Spark SQL são duas portas de entrada
 # MAGIC pro mesmo Catalyst Optimizer — o plano físico não muda. Neste lab você não vai confiar na palavra
-# MAGIC do professor: vai **provar isso na tela**, com o mesmo dataset do Bitcoin Historical Data.
+# MAGIC do professor: vai **provar isso na tela**, com o mesmo histórico do BTC/USD do Lab 1.
 # MAGIC
 # MAGIC **Ambiente:** o mesmo do Lab 1 — Databricks Runtime 17.3 LTS, compute clássico, access mode
 # MAGIC Dedicated, Unity Catalog.
+# MAGIC
+# MAGIC **Requer o Lab 1 já rodado** — este lab lê o arquivo que o setup do Lab 1 extraiu da API.
 # MAGIC
 # MAGIC **Objetivo:** definir schema explícito (Python e DDL), escrever em Parquet e em tabela, e provar —
 # MAGIC com `explain()` e `sameSemantics()`, não de olho — que DataFrame API e SQL geram o mesmo plano.
@@ -17,8 +19,7 @@
 # MAGIC %md
 # MAGIC ## Configuração e setup
 # MAGIC
-# MAGIC Mesma configuração do Lab 1. Pode rodar de novo sem medo: schema e volume só são criados se não
-# MAGIC existirem, e o CSV é baixado por cima do anterior.
+# MAGIC Mesma configuração do Lab 1. O arquivo do histórico já está no Volume; aqui só conferimos.
 
 # COMMAND ----------
 
@@ -31,18 +32,18 @@ assert CATALOGO not in ("hive_metastore", "spark_catalog"), (
 )
 print(f"Catálogo: {CATALOGO} | Schema: {SCHEMA} | Volume: {VOLUME}")
 
+# O timestamp da API marca meia-noite em UTC. A sessão no mesmo relógio garante a data certa.
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+
 # COMMAND ----------
 
-import urllib.request
+import os
 
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOGO}.{SCHEMA}")
-spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOGO}.{SCHEMA}.{VOLUME}")
-
-URL_CSV = "https://raw.githubusercontent.com/dltreinamentosdata-ai/spark-fundamentals/main/dados/bitcoin_historico.csv"
-CAMINHO_CSV = f"/Volumes/{CATALOGO}/{SCHEMA}/{VOLUME}/bitcoin_historico.csv"
+PASTA_BTC = f"/Volumes/{CATALOGO}/{SCHEMA}/{VOLUME}/btcusd"
+CAMINHO_HISTORICO = f"{PASTA_BTC}/btcusd_2011-08-18_2026-09-30.json"
 CAMINHO_PARQUET = f"/Volumes/{CATALOGO}/{SCHEMA}/{VOLUME}/bitcoin_historico.parquet"
 
-urllib.request.urlretrieve(URL_CSV, CAMINHO_CSV)
+assert os.path.exists(CAMINHO_HISTORICO), "Arquivo do histórico não encontrado — rode o setup do Lab 1."
 
 # COMMAND ----------
 
@@ -53,55 +54,42 @@ urllib.request.urlretrieve(URL_CSV, CAMINHO_CSV)
 
 # COMMAND ----------
 
-df_inferido = (
-    spark.read.format("csv")
-    .option("header", "true")
-    .option("inferSchema", "true")
-    .load(CAMINHO_CSV)
-)
+df_inferido = spark.read.format("json").load(CAMINHO_HISTORICO)
 df_inferido.printSchema()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Confira a Spark UI: apareceram **Jobs novos**, e você ainda não rodou nenhuma action. Ler é
-# MAGIC normalmente lazy; inferência de schema é a exceção — pra adivinhar os tipos, o Spark precisa abrir
-# MAGIC o arquivo e varrer o dado. É uma passada extra, paga antes de qualquer trabalho de verdade.
+# MAGIC Confira a Spark UI: apareceu **um Job novo**, e você ainda não rodou nenhuma action. Ler é
+# MAGIC normalmente lazy; inferência de schema é a exceção — pra descobrir colunas e tipos, o Spark precisa
+# MAGIC abrir o arquivo e varrer o dado. É uma passada extra, paga antes de qualquer trabalho de verdade.
 # MAGIC
-# MAGIC E o resultado nem saiu bom. Como você viu no Lab 1, a vírgula de milhar em
-# MAGIC `Price`/`Open`/`High`/`Low` e o sufixo `K`/`M`/`%` em `Vol.`/`Change %` fazem a inferência desistir:
-# MAGIC tudo virou `string`. Em outros arquivos o erro é mais traiçoeiro: telefone, CEP e número de conta
-# MAGIC viram número e perdem o zero à esquerda, sem aviso.
+# MAGIC E o resultado nem saiu bom. Como você viu no Lab 1, a API manda os números entre aspas, então tudo
+# MAGIC virou `string`, e as colunas vieram em ordem alfabética. Em outros arquivos o erro é mais
+# MAGIC traiçoeiro: telefone, CEP e número de conta viram número e perdem o zero à esquerda, sem aviso.
 # MAGIC
-# MAGIC Custo escondido e tipo não confiável. Schema explícito resolve os dois.
+# MAGIC Custo escondido e resultado que você não controla. Schema explícito resolve os dois.
 # MAGIC
 # MAGIC ## Exercício 2 — schema explícito, versão Python (`StructType`)
 # MAGIC
-# MAGIC Só `Date` ganha tipo de verdade aqui (`DateType`, via `dateFormat` na leitura) — as outras 6
-# MAGIC colunas ficam `StringType` de propósito: limpar vírgula de milhar e sufixo `K`/`M`/`%` é conteúdo
-# MAGIC do Lab 3, não deste.
+# MAGIC As 6 colunas ficam `StringType` de propósito: é o que o arquivo realmente traz. Converter texto em
+# MAGIC número e em data é conteúdo do Lab 3, não deste. O que você ganha aqui é a ordem das colunas que
+# MAGIC você escolheu e uma leitura sem passada extra.
 
 # COMMAND ----------
 
-from pyspark.sql.types import StructType, StructField, StringType, DateType
+from pyspark.sql.types import StructType, StructField, StringType
 
 schema_python = StructType([
-    StructField("Date", DateType(), True),
-    StructField("Price", StringType(), True),
-    StructField("Open", StringType(), True),
-    StructField("High", StringType(), True),
-    StructField("Low", StringType(), True),
-    StructField("Vol.", StringType(), True),
-    StructField("Change %", StringType(), True),
+    StructField("timestamp", StringType(), True),
+    StructField("open", StringType(), True),
+    StructField("high", StringType(), True),
+    StructField("low", StringType(), True),
+    StructField("close", StringType(), True),
+    StructField("volume", StringType(), True),
 ])
 
-df_schema_python = (
-    spark.read.format("csv")
-    .option("header", "true")
-    .option("dateFormat", "MMM dd, yyyy")
-    .schema(schema_python)
-    .load(CAMINHO_CSV)
-)
+df_schema_python = spark.read.format("json").schema(schema_python).load(CAMINHO_HISTORICO)
 df_schema_python.printSchema()
 
 # COMMAND ----------
@@ -110,24 +98,20 @@ df_schema_python.printSchema()
 # MAGIC Volte na Spark UI. Confirme: **nenhum Job novo** apareceu com esta leitura — schema explícito é só
 # MAGIC metadado, não toca o dado.
 # MAGIC
+# MAGIC Um aviso antes de seguir: dá vontade de declarar logo `close` como `DoubleType`. Não faça isso
+# MAGIC aqui. No arquivo o número está entre aspas, e o leitor de JSON não converte texto em `double`: em
+# MAGIC vez de erro, a coluna volta **`NULL` em todas as linhas**, sem aviso. Depois de trocar um tipo no
+# MAGIC schema, olhe o dado, não só o `printSchema()`.
+# MAGIC
 # MAGIC ## Exercício 3 — o mesmo schema, versão DDL
 # MAGIC
 # MAGIC Mesma ideia, outra sintaxe — a que se parece com SQL puro, e a que você mais vai ver no Databricks.
 
 # COMMAND ----------
 
-schema_ddl = (
-    "Date DATE, Price STRING, Open STRING, High STRING, Low STRING, "
-    "`Vol.` STRING, `Change %` STRING"
-)
+schema_ddl = "timestamp STRING, open STRING, high STRING, low STRING, close STRING, volume STRING"
 
-df_schema_ddl = (
-    spark.read.format("csv")
-    .option("header", "true")
-    .option("dateFormat", "MMM dd, yyyy")
-    .schema(schema_ddl)
-    .load(CAMINHO_CSV)
-)
+df_schema_ddl = spark.read.format("json").schema(schema_ddl).load(CAMINHO_HISTORICO)
 df_schema_ddl.printSchema()
 
 # COMMAND ----------
@@ -152,7 +136,7 @@ display(dbutils.fs.ls(CAMINHO_PARQUET))
 # MAGIC %md
 # MAGIC Repare: o Parquet não é um arquivo, é um **diretório**. Cada partição do DataFrame é gravada por
 # MAGIC uma task, em paralelo, e vira um arquivo `part-`. Aqui o DataFrame tem 1 partição, então é 1
-# MAGIC arquivo de dado (mais os arquivos de controle). E, diferente do CSV, o Parquet carrega o schema
+# MAGIC arquivo de dado (mais os arquivos de controle). E, diferente do JSON, o Parquet carrega o schema
 # MAGIC junto — pra ler de volta não precisa inferir nem declarar nada.
 # MAGIC
 # MAGIC Agora a tabela. Arquivo solto funciona, mas o padrão de produção no Databricks é tabela no Unity
@@ -160,13 +144,9 @@ display(dbutils.fs.ls(CAMINHO_PARQUET))
 
 # COMMAND ----------
 
-# Tabela Delta (o formato padrão do Databricks) não aceita espaço em nome de coluna: gravar
-# "Change %" direto falha com DELTA_INVALID_CHARACTERS_IN_COLUMN_NAMES. Ponto não é proibido
-# (`Vol.` sozinho passaria), mas renomeamos os dois juntos por clareza.
 TABELA_HISTORICO = f"{CATALOGO}.{SCHEMA}.bitcoin_historico"
 
-df_para_tabela = df_schema_ddl.withColumnRenamed("Vol.", "Vol").withColumnRenamed("Change %", "Change_pct")
-df_para_tabela.write.mode("overwrite").saveAsTable(TABELA_HISTORICO)
+df_schema_ddl.write.mode("overwrite").saveAsTable(TABELA_HISTORICO)
 
 # COMMAND ----------
 
@@ -178,22 +158,27 @@ df_para_tabela.write.mode("overwrite").saveAsTable(TABELA_HISTORICO)
 # MAGIC ## Exercício 5 — a prova de equivalência
 # MAGIC
 # MAGIC A pergunta: "quantos dias de registro por ano, do maior pro menor?" — respondida de duas formas.
+# MAGIC
+# MAGIC Pra tirar o ano de um `timestamp` Unix em texto são dois passos: `cast` pra número inteiro e
+# MAGIC `timestamp_seconds`, que transforma segundos em data e hora. O Lab 3 destrincha essa conversão;
+# MAGIC aqui ela só precisa ser **a mesma** dos dois lados. (No SQL abaixo, `timestamp` é o nome da
+# MAGIC coluna, não o tipo.)
 
 # COMMAND ----------
 
-from pyspark.sql.functions import col, count, year
+from pyspark.sql.functions import col, count, timestamp_seconds, year
 
 df_schema_ddl.createOrReplaceTempView("bitcoin_view")
 
 sql_result = spark.sql("""
-    SELECT year(Date) AS ano, count(*) AS total
+    SELECT year(timestamp_seconds(CAST(timestamp AS BIGINT))) AS ano, count(*) AS total
     FROM bitcoin_view
-    GROUP BY year(Date)
+    GROUP BY year(timestamp_seconds(CAST(timestamp AS BIGINT)))
     ORDER BY total DESC
 """)
 
 df_result = (
-    df_schema_ddl.groupBy(year(col("Date")).alias("ano"))
+    df_schema_ddl.groupBy(year(timestamp_seconds(col("timestamp").cast("bigint"))).alias("ano"))
     .agg(count("*").alias("total"))
     .orderBy(col("total").desc())
 )
@@ -244,16 +229,20 @@ from pyspark.sql.functions import dayofweek, when
 
 sql_desafio = spark.sql("""
     SELECT
-        CASE WHEN dayofweek(Date) IN (1, 7) THEN 'fim_de_semana' ELSE 'dia_util' END AS tipo_dia,
+        CASE WHEN dayofweek(timestamp_seconds(CAST(timestamp AS BIGINT))) IN (1, 7)
+             THEN 'fim_de_semana' ELSE 'dia_util' END AS tipo_dia,
         count(*) AS total
     FROM bitcoin_view
-    GROUP BY CASE WHEN dayofweek(Date) IN (1, 7) THEN 'fim_de_semana' ELSE 'dia_util' END
+    GROUP BY CASE WHEN dayofweek(timestamp_seconds(CAST(timestamp AS BIGINT))) IN (1, 7)
+                  THEN 'fim_de_semana' ELSE 'dia_util' END
 """)
+
+dia_da_semana = dayofweek(timestamp_seconds(col("timestamp").cast("bigint")))
 
 # Agrupando DIRETO na expressão, como o SQL faz
 df_desafio = (
     df_schema_ddl.groupBy(
-        when(dayofweek(col("Date")).isin(1, 7), "fim_de_semana").otherwise("dia_util").alias("tipo_dia")
+        when(dia_da_semana.isin(1, 7), "fim_de_semana").otherwise("dia_util").alias("tipo_dia")
     )
     .agg(count("*").alias("total"))
 )
@@ -270,7 +259,7 @@ sql_desafio.sameSemantics(df_desafio)
 
 df_desafio_withcolumn = (
     df_schema_ddl.withColumn(
-        "tipo_dia", when(dayofweek(col("Date")).isin(1, 7), "fim_de_semana").otherwise("dia_util")
+        "tipo_dia", when(dia_da_semana.isin(1, 7), "fim_de_semana").otherwise("dia_util")
     )
     .groupBy("tipo_dia")
     .agg(count("*").alias("total"))
@@ -305,9 +294,9 @@ df_desafio_withcolumn.explain()
 # MAGIC **não** prova que a execução é diferente — só que o caminho escrito foi outro. Quem dá a palavra
 # MAGIC final é o plano físico.
 # MAGIC
-# MAGIC Curiosidade que o resultado confirma: Bitcoin negocia 24/7 — o dataset não tem um único dia
-# MAGIC faltando no calendário inteiro (18/07/2010–02/08/2020), diferente de um dataset de bolsa de
-# MAGIC ações, que pularia sábado e domingo.
+# MAGIC Curiosidade que o resultado confirma: o mercado de Bitcoin não fecha — o dataset tem uma linha
+# MAGIC pra cada dia do calendário (18/08/2011–30/09/2026), sábado e domingo incluídos, diferente de um
+# MAGIC dataset de bolsa de ações.
 # MAGIC
 # MAGIC ## Checkpoint
 # MAGIC
@@ -319,5 +308,5 @@ df_desafio_withcolumn.explain()
 # MAGIC
 # MAGIC Schema explícito (Python e DDL, mesmo resultado), gravação em Parquet e em tabela, e a prova real de
 # MAGIC que SQL e DataFrame API terminam no mesmo plano — Módulo 2 fechado. No **Lab 3** você aplica o
-# MAGIC mesmo dataset num pipeline de ETL completo, do zero — inclusive limpando, finalmente, a vírgula de
-# MAGIC milhar e os sufixos que este lab deixou de propósito sem tocar.
+# MAGIC mesmo dataset num pipeline de ETL completo, do zero — inclusive convertendo, finalmente, o texto
+# MAGIC em número e em data, que este lab deixou de propósito sem tocar.

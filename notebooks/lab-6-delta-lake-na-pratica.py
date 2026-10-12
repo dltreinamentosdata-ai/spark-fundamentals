@@ -1,35 +1,43 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Lab 6 — Delta Lake na prática: histórico, time travel, MERGE e RESTORE
+# MAGIC # Lab 6 — Delta Lake na prática: carga diária, time travel, MERGE e RESTORE
 # MAGIC
 # MAGIC **Fecha o Módulo 6 (Bônus).** `bitcoin_limpo` já é uma tabela Delta — o Lab 3 gravou ela com
 # MAGIC `saveAsTable`, que no Databricks usa Delta por padrão, sem ninguém ter pedido. Este lab explora o
 # MAGIC que isso já dava de graça: histórico de versões, time travel, upsert com `MERGE` e a volta no tempo
-# MAGIC com `RESTORE`.
+# MAGIC com `RESTORE`. E é aqui que o dataset deixa de ser um período fechado: você vai rodar a **carga
+# MAGIC diária**, que traz da API os dias depois de 30/09/2026 e acrescenta na tabela.
 # MAGIC
 # MAGIC **Nota de escopo:** igual à aula 6.1, este lab é só o modelo mental — não é manutenção de tabela.
 # MAGIC `OPTIMIZE`, `VACUUM` e liquid clustering ficam fora deste curso.
 # MAGIC
 # MAGIC **Ambiente:** o mesmo dos outros labs (Databricks Runtime 17.3 LTS, Unity Catalog). Este lab não
-# MAGIC depende da Spark UI nem da RDD API.
+# MAGIC depende da Spark UI nem da RDD API. O cluster precisa de saída pra internet: a carga diária chama
+# MAGIC a API.
 # MAGIC
-# MAGIC **Requer o Lab 3 já rodado** — este lab lê e modifica a tabela `bitcoin_limpo` que o Lab 3 gravou.
+# MAGIC **Requer os Labs 1 e 3 já rodados** — este lab acrescenta arquivos na pasta que o Lab 1 criou e
+# MAGIC lê e modifica a tabela `bitcoin_limpo` que o Lab 3 gravou.
 # MAGIC No último exercício você desfaz todas as mudanças. Se parar antes dele, rode o Lab 3 de novo
 # MAGIC antes de repetir este lab — assim a tabela volta ao estado limpo.
 # MAGIC
-# MAGIC **Objetivo:** consultar o histórico de versões de uma tabela Delta, ler uma versão anterior por
-# MAGIC time travel, fazer um upsert com `MERGE` e restaurar a tabela.
+# MAGIC **Objetivo:** consultar o histórico de versões de uma tabela Delta, acrescentar um lote novo com
+# MAGIC uma carga incremental, ler uma versão anterior por time travel, fazer um upsert com `MERGE` e
+# MAGIC restaurar a tabela.
 
 # COMMAND ----------
 
 CATALOGO = spark.catalog.currentCatalog()
 SCHEMA = "spark_fundamentals"
+VOLUME = "dados"
 
 assert CATALOGO not in ("hive_metastore", "spark_catalog"), (
     "CATALOGO precisa ser um catálogo do Unity Catalog — troque o valor acima pelo nome do seu."
 )
 
 TABELA_LIMPA = f"{CATALOGO}.{SCHEMA}.bitcoin_limpo"
+
+# O timestamp da API marca meia-noite em UTC. A sessão no mesmo relógio garante a data certa.
+spark.conf.set("spark.sql.session.timeZone", "UTC")
 
 # COMMAND ----------
 
@@ -64,18 +72,124 @@ print(f"Versão inicial: {versao_inicial} | linhas: {linhas_iniciais}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Exercício 2 — gere uma versão nova de propósito
+# MAGIC ## Exercício 2 — a carga diária
 # MAGIC
-# MAGIC Vamos acrescentar uma linha: a de maior preço, repetida.
+# MAGIC A tabela parou em 30/09/2026. O processo de todo dia tem três passos: **extrair** os dias novos,
+# MAGIC **limpar** com a mesma cadeia do Lab 3 e **acrescentar** na tabela.
+# MAGIC
+# MAGIC Primeiro a extração. É a função do setup do Lab 1, sem mudar uma linha — só que agora chamada sem
+# MAGIC data limite. Ela olha o último dia que já está na pasta e traz dali até **ontem (D-1)**.
 
 # COMMAND ----------
 
-from pyspark.sql.functions import col
+import datetime
+import json
+import os
+import urllib.request
+
+PASTA_BTC = f"/Volumes/{CATALOGO}/{SCHEMA}/{VOLUME}/btcusd"
+URL_API = (
+    "https://www.bitstamp.net/api/v2/ohlc/btcusd/"
+    "?step=86400&limit=1000&exclude_current_candle=true&start={inicio}"
+)
+PRIMEIRO_DIA = datetime.date(2011, 8, 18)  # primeiro dia que a Bitstamp tem
+UTC = datetime.timezone.utc
+
+
+def para_epoch(dia):
+    return int(datetime.datetime(dia.year, dia.month, dia.day, tzinfo=UTC).timestamp())
+
+
+def extrair_btc(ate=None):
+    """Baixa os dias que ainda faltam na pasta: do último já gravado até `ate` (padrão: ontem)."""
+    os.makedirs(PASTA_BTC, exist_ok=True)
+    ontem = datetime.datetime.now(UTC).date() - datetime.timedelta(days=1)
+    ate = min(ate or ontem, ontem)
+
+    # Marca d'água: o nome de cada arquivo termina no último dia que ele contém.
+    ultimos_dias = [
+        datetime.date.fromisoformat(nome[-15:-5])
+        for nome in os.listdir(PASTA_BTC)
+        if nome.endswith(".json")
+    ]
+    de = max(ultimos_dias) + datetime.timedelta(days=1) if ultimos_dias else PRIMEIRO_DIA
+    if de > ate:
+        print(f"Nada novo: a pasta já tem os dias até {max(ultimos_dias)}.")
+        return None
+
+    dias = []
+    inicio = para_epoch(de)
+    while inicio <= para_epoch(ate):  # a API devolve no máximo 1.000 dias por chamada
+        with urllib.request.urlopen(URL_API.format(inicio=inicio), timeout=60) as resposta:
+            dias += json.load(resposta)["data"]["ohlc"]
+        inicio += 1000 * 86400
+    dias = [d for d in dias if para_epoch(de) <= int(d["timestamp"]) <= para_epoch(ate)]
+
+    esperados = (ate - de).days + 1  # o histórico tem uma linha por dia do calendário
+    if len(dias) != esperados:
+        raise RuntimeError(f"A API devolveu {len(dias)} dias, eram {esperados}. Nada foi gravado; rode de novo.")
+
+    caminho = f"{PASTA_BTC}/btcusd_{de}_{ate}.json"
+    with open(caminho, "w") as arquivo:
+        for dia in dias:  # um objeto JSON por linha (JSON Lines)
+            arquivo.write(json.dumps(dia) + "\n")
+    print(f"{len(dias)} dias gravados ({de} a {ate}) em {caminho}")
+    return caminho
+
+# COMMAND ----------
+
+extrair_btc()
+display(dbutils.fs.ls(PASTA_BTC))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC A pasta ganhou um arquivo só com os dias novos; o do histórico não foi tocado. Rode a célula de
+# MAGIC novo: ela avisa que não há nada novo e não chama a API. Amanhã, traria um dia.
+# MAGIC
+# MAGIC Agora a limpeza e a gravação. A pasta guarda tudo o que já foi extraído; quem diz **até onde já foi
+# MAGIC carregado** é a própria tabela, pelo maior valor de `data`. Só passa o que vem depois dele.
+# MAGIC
+# MAGIC O Z-score dos dias novos usa a média e o desvio que a tabela já tem, pra ficar na mesma régua das
+# MAGIC linhas antigas.
+
+# COMMAND ----------
+
+from pyspark.sql.functions import col, mean, stddev, timestamp_seconds, when, year
 
 df = spark.table(TABELA_LIMPA)
 
-linha_maior_preco = df.orderBy(col("preco_usd").desc()).limit(1)
-linha_maior_preco.write.mode("append").saveAsTable(TABELA_LIMPA)
+ultimo_dia = df.selectExpr("max(data)").first()[0]
+stats = df.select(mean("preco_usd").alias("media"), stddev("preco_usd").alias("desvio")).first()
+
+schema = "timestamp STRING, open STRING, high STRING, low STRING, close STRING, volume STRING"
+
+novos_df = (
+    spark.read.format("json").schema(schema).load(PASTA_BTC)  # a pasta inteira: histórico + lotes diários
+    .select(
+        col("timestamp").alias("data_raw"), col("close").alias("preco_raw"),
+        col("open").alias("abertura_raw"), col("volume").alias("volume_raw"),
+    )
+    .withColumn("volume_raw", when(col("volume_raw") == "0.00000000", None).otherwise(col("volume_raw")))
+    .na.drop(subset=["volume_raw"])
+    .withColumn("preco_usd", col("preco_raw").try_cast("double"))
+    .withColumn("abertura_usd", col("abertura_raw").try_cast("double"))
+    .withColumn("volume", col("volume_raw").try_cast("double"))
+    .withColumn("data", timestamp_seconds(col("data_raw").try_cast("bigint")).cast("date"))
+    .withColumn("ano", year(col("data")))
+    .filter(col("data").isNotNull() & col("preco_usd").isNotNull())
+    .filter(col("data") > ultimo_dia)  # só o que a tabela ainda não tem
+    .withColumn("fechou_em_alta", when(col("preco_usd") > col("abertura_usd"), True).otherwise(False))
+    .withColumn(
+        "faixa_preco",
+        when(col("preco_usd") < 1000, "baixo").when(col("preco_usd") <= 10000, "médio").otherwise("alto"),
+    )
+    .withColumn("preco_zscore", (col("preco_usd") - stats["media"]) / stats["desvio"])
+    .select("data", "ano", "preco_usd", "abertura_usd", "volume", "fechou_em_alta", "faixa_preco", "preco_zscore")
+)
+
+print(f"Tabela ia até {ultimo_dia}. Dias novos: {novos_df.count()}")
+novos_df.write.mode("append").saveAsTable(TABELA_LIMPA)
 
 # COMMAND ----------
 
@@ -86,7 +200,7 @@ spark.sql(f"DESCRIBE HISTORY {TABELA_LIMPA}").select("version", "timestamp", "op
 # MAGIC %md
 # MAGIC Apareceu **uma linha nova** no topo, com `version` maior que a inicial. Os arquivos Parquet que já
 # MAGIC existiam não foram tocados — o `_delta_log` só ganhou um commit novo, listando o arquivo que este
-# MAGIC append acrescentou.
+# MAGIC append acrescentou. É assim que uma tabela Delta cresce um lote por dia.
 # MAGIC
 # MAGIC ## Exercício 3 — time travel
 
@@ -95,8 +209,8 @@ spark.sql(f"DESCRIBE HISTORY {TABELA_LIMPA}").select("version", "timestamp", "op
 df_versao_antiga = spark.read.option("versionAsOf", versao_inicial).table(TABELA_LIMPA)
 df_atual = spark.table(TABELA_LIMPA)
 
-print(f"Linhas na versão {versao_inicial} (antes do Exercício 2): {df_versao_antiga.count()}")
-print(f"Linhas na versão atual (depois do Exercício 2): {df_atual.count()}")
+print(f"Linhas na versão {versao_inicial} (antes da carga diária): {df_versao_antiga.count()}")
+print(f"Linhas na versão atual (depois da carga diária): {df_atual.count()}")
 
 # COMMAND ----------
 
@@ -106,7 +220,7 @@ spark.sql(f"SELECT count(*) AS linhas FROM {TABELA_LIMPA} VERSION AS OF {versao_
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC A diferença é exatamente 1 — a linha que você acrescentou. A versão anterior continua lá, intacta;
+# MAGIC A diferença é exatamente o número de dias que a carga trouxe. A versão anterior continua lá, intacta;
 # MAGIC ela só não é mais a que a leitura pega por padrão (sem `versionAsOf`, a leitura sempre usa a versão
 # MAGIC mais recente).
 # MAGIC
@@ -117,10 +231,8 @@ spark.sql(f"SELECT count(*) AS linhas FROM {TABELA_LIMPA} VERSION AS OF {versao_
 
 # COMMAND ----------
 
-import datetime
-
 data_existente = df.selectExpr("min(data)").first()[0]
-data_nova = datetime.date(2020, 8, 3)   # o dia seguinte ao último do dataset
+data_nova = df.selectExpr("max(data)").first()[0] + datetime.timedelta(days=1)   # o dia seguinte ao último da tabela
 
 spark.sql(f"""
     SELECT data, preco_usd FROM {TABELA_LIMPA}
@@ -168,8 +280,8 @@ spark.sql(f"DESCRIBE HISTORY {TABELA_LIMPA}").select("version", "timestamp", "op
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Aponte qual `version` corresponde a cada exercício: a gravação do Lab 3, o `WRITE` do append
-# MAGIC (Exercício 2) e o `MERGE` (Exercício 4). É o mesmo log que a aula 6.1 desenhou no board, agora na
+# MAGIC Aponte qual `version` corresponde a cada exercício: a gravação do Lab 3, o `WRITE` da carga
+# MAGIC diária (Exercício 2) e o `MERGE` (Exercício 4). É o mesmo log que a aula 6.1 desenhou no board, agora na
 # MAGIC tela. Repare que o `MERGE` aparece como **uma versão só**, mesmo tendo atualizado uma linha e
 # MAGIC inserido outra: é um commit atômico, não duas operações separadas.
 # MAGIC
@@ -190,7 +302,10 @@ spark.sql(f"DESCRIBE HISTORY {TABELA_LIMPA}").select("version", "timestamp", "op
 # MAGIC %md
 # MAGIC A tabela voltou a ter o número de linhas do início — e o histórico **não encolheu**: ganhou mais
 # MAGIC uma linha, `RESTORE`. O log nunca é reescrito; voltar no tempo é, ele mesmo, um commit novo. As
-# MAGIC versões do append e do `MERGE` continuam lá, consultáveis por time travel.
+# MAGIC versões da carga diária e do `MERGE` continuam lá, consultáveis por time travel.
+# MAGIC
+# MAGIC Os arquivos que a extração baixou continuam na pasta. Se você rodar este lab de novo, a carga
+# MAGIC diária reaproveita esses arquivos e só chama a API pelos dias que ainda faltam.
 # MAGIC
 # MAGIC ## Checkpoint
 # MAGIC
@@ -199,6 +314,7 @@ spark.sql(f"DESCRIBE HISTORY {TABELA_LIMPA}").select("version", "timestamp", "op
 # MAGIC
 # MAGIC ## Fechamento — o bônus, numa frase
 # MAGIC
-# MAGIC Delta não é mágica: é Parquet mais um log, que você acabou de ler várias vezes nesta sessão.
+# MAGIC Delta não é mágica: é Parquet mais um log, que você acabou de ler várias vezes nesta sessão — e
+# MAGIC que cresce um commit por vez, a cada lote que chega.
 # MAGIC Manter e otimizar essa tabela (`OPTIMIZE`, `VACUUM`, liquid clustering) fica fora deste curso —
 # MAGIC aqui você fechou o modelo mental.

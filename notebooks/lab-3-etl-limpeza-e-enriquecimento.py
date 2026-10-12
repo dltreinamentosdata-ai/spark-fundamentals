@@ -1,16 +1,18 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Lab 3 — ETL: limpando e enriquecendo o Bitcoin Historical Data
+# MAGIC # Lab 3 — ETL: limpando e enriquecendo o histórico do BTC/USD
 # MAGIC
 # MAGIC **Fecha o Módulo 3.** Chega de exemplo de brinquedo — este lab é o pipeline de ETL básico
 # MAGIC completo, do zero, na ordem que as aulas 3.1 e 3.2 defenderam: **projetar cedo, tratar nulos
 # MAGIC (inclusive um nulo disfarçado de texto), converter tipos, derivar coluna, categorizar, enriquecer**.
 # MAGIC A ordem não é enfeite: cada passo prepara o próximo, e o checkpoint no fim pede que você justifique
-# MAGIC cada um. É também aqui que a vírgula de milhar e os sufixos `K`/`M` que os Labs 1 e 2 deixaram
-# MAGIC intocados finalmente saem do caminho.
+# MAGIC cada um. É também aqui que o texto que os Labs 1 e 2 deixaram intocado finalmente vira número e
+# MAGIC data.
 # MAGIC
 # MAGIC **Ambiente:** o mesmo dos Labs 1 e 2 — Databricks Runtime 17.3 LTS, compute clássico, access mode
 # MAGIC Dedicated, Unity Catalog.
+# MAGIC
+# MAGIC **Requer o Lab 1 já rodado** — este lab lê o arquivo que o setup do Lab 1 extraiu da API.
 # MAGIC
 # MAGIC **Objetivo:** ao final, ter rodado o pipeline inteiro e saber justificar, passo a passo, **por que**
 # MAGIC aquela ordem — não só executar os comandos.
@@ -20,7 +22,7 @@
 # MAGIC %md
 # MAGIC ## Configuração e setup
 # MAGIC
-# MAGIC Mesma configuração dos labs anteriores; o setup é idempotente.
+# MAGIC Mesma configuração dos labs anteriores. O arquivo do histórico já está no Volume.
 
 # COMMAND ----------
 
@@ -33,54 +35,45 @@ assert CATALOGO not in ("hive_metastore", "spark_catalog"), (
 )
 print(f"Catálogo: {CATALOGO} | Schema: {SCHEMA} | Volume: {VOLUME}")
 
+# O timestamp da API marca meia-noite em UTC. A sessão no mesmo relógio garante a data certa.
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+
 # COMMAND ----------
 
-import urllib.request
+import os
 
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOGO}.{SCHEMA}")
-spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOGO}.{SCHEMA}.{VOLUME}")
-
-URL_CSV = "https://raw.githubusercontent.com/dltreinamentosdata-ai/spark-fundamentals/main/dados/bitcoin_historico.csv"
-CAMINHO_CSV = f"/Volumes/{CATALOGO}/{SCHEMA}/{VOLUME}/bitcoin_historico.csv"
+PASTA_BTC = f"/Volumes/{CATALOGO}/{SCHEMA}/{VOLUME}/btcusd"
+CAMINHO_HISTORICO = f"{PASTA_BTC}/btcusd_2011-08-18_2026-09-30.json"
 TABELA_LIMPA = f"{CATALOGO}.{SCHEMA}.bitcoin_limpo"
 
-urllib.request.urlretrieve(URL_CSV, CAMINHO_CSV)
+assert os.path.exists(CAMINHO_HISTORICO), "Arquivo do histórico não encontrado — rode o setup do Lab 1."
 
 # COMMAND ----------
 
 from pyspark.sql.functions import col
 
-# Tudo STRING de propósito — a conversão de verdade é o Exercício 4, não o schema de leitura.
-schema = (
-    "Date STRING, Price STRING, Open STRING, High STRING, Low STRING, "
-    "`Vol.` STRING, `Change %` STRING"
-)
+# Tudo STRING de propósito — é o que o arquivo traz. A conversão de verdade é o Exercício 4.
+schema = "timestamp STRING, open STRING, high STRING, low STRING, close STRING, volume STRING"
 
-btc_raw_df = (
-    spark.read.format("csv")
-    .option("header", "true")
-    .schema(schema)
-    .load(CAMINHO_CSV)
-)
+btc_raw_df = spark.read.format("json").schema(schema).load(CAMINHO_HISTORICO)
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Exercício 1 — projete cedo (*filter early, filter often*)
 # MAGIC
-# MAGIC O dataset bruto tem 7 colunas. O pipeline só precisa de 4: `Date`, `Price`, `Open` e `Vol.`.
-# MAGIC Corte agora, antes de gastar processamento limpando coluna que nem vai sobreviver — e renomeie com
-# MAGIC `col().alias()`, como na aula 3.1 (`alias()` é método do objeto Column).
+# MAGIC O dataset bruto tem 6 colunas. O pipeline só precisa de 4: `timestamp`, `close` (o preço de
+# MAGIC fechamento do dia), `open` e `volume`. Corte agora, antes de gastar processamento limpando coluna
+# MAGIC que nem vai sobreviver — e renomeie com `col().alias()`, como na aula 3.1 (`alias()` é método do
+# MAGIC objeto Column).
 
 # COMMAND ----------
 
-# col("Vol.") quebra com "Syntax error in the attribute name" — o ponto faz o col() tentar ler como
-# caminho de campo aninhado. Com crase funciona: col("`Vol.`").
 btc_cols_df = btc_raw_df.select(
-    col("Date").alias("data_raw"),
-    col("Price").alias("preco_raw"),
-    col("Open").alias("abertura_raw"),
-    col("`Vol.`").alias("volume_raw"),
+    col("timestamp").alias("data_raw"),
+    col("close").alias("preco_raw"),
+    col("open").alias("abertura_raw"),
+    col("volume").alias("volume_raw"),
 )
 
 contagem_inicial = btc_cols_df.count()
@@ -119,28 +112,29 @@ btc_cols_df.select(
 
 # COMMAND ----------
 
-btc_cols_df.filter(col("volume_raw") == "-").count()
+btc_cols_df.filter(col("volume_raw") == "0.00000000").count()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC **6.** O CSV não tem célula vazia nenhuma — quando o provedor não tinha volume pra registrar
-# MAGIC naquele dia, ele gravou o texto `"-"` no lugar, não deixou em branco. Pro Spark, `"-"` é um texto
-# MAGIC válido como qualquer outro — `isNull()` não pega isso. É a pegadinha que o Lab 1 antecipou
+# MAGIC **33.** O arquivo não tem campo vazio nenhum — nos dias em que ninguém negociou, a API gravou o
+# MAGIC texto `"0.00000000"` no volume e repetiu o último preço conhecido em `open`, `high`, `low` e
+# MAGIC `close`. Não é um preço daquele dia: é a ausência de preço, preenchida. Pro Spark, `"0.00000000"` é
+# MAGIC um texto válido como qualquer outro — `isNull()` não pega isso. É a pegadinha que o Lab 1 antecipou
 # MAGIC (Exercício 5): nem toda ausência de dado chega como `null`.
 # MAGIC
 # MAGIC ## Exercício 3 — trate os nulos (de verdade, desta vez)
 # MAGIC
-# MAGIC Primeiro transforme o `"-"` em `null` de verdade. Só depois o `na.drop` consegue enxergar essas
-# MAGIC linhas.
+# MAGIC Primeiro transforme o `"0.00000000"` em `null` de verdade. Só depois o `na.drop` consegue enxergar
+# MAGIC essas linhas.
 
 # COMMAND ----------
 
 btc_normalizado_df = btc_cols_df.withColumn(
-    "volume_raw", when(col("volume_raw") == "-", None).otherwise(col("volume_raw"))
+    "volume_raw", when(col("volume_raw") == "0.00000000", None).otherwise(col("volume_raw"))
 )
 
-# volume é obrigatório pra qualquer leitura de liquidez — sem ele a linha não serve pro pipeline
+# sem negociação não há preço do dia — a linha não serve pro pipeline
 btc_sem_nulos_df = btc_normalizado_df.na.drop(subset=["volume_raw"])
 
 print(f"Linhas depois do na.drop(volume_raw): {btc_sem_nulos_df.count()} (era {contagem_inicial})")
@@ -148,19 +142,21 @@ print(f"Linhas depois do na.drop(volume_raw): {btc_sem_nulos_df.count()} (era {c
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC As 6 linhas removidas são consecutivas: 20 a 25/jun/2011, seis dias seguidos sem volume
-# MAGIC registrado no export. É pouco (6 em 3.669, ~0,16%), mas é real — não é erro de leitura.
+# MAGIC Das 33 linhas removidas, 30 são de 2011, quando a corretora tinha acabado de abrir e passava dias
+# MAGIC sem nenhum negócio. As outras 3 são seguidas: 6 a 8/jan/2015, quando ela ficou fora do ar. É pouco
+# MAGIC (33 em 5.523, ~0,6%), mas é real — não é erro de leitura.
 # MAGIC
 # MAGIC ## Exercício 4 — converta os tipos (com `try_cast`)
 # MAGIC
-# MAGIC **Spark 3 × Spark 4.** No Spark 3, `.cast("double")` num texto inválido devolvia `NULL` sem avisar.
+# MAGIC **Spark 3 × Spark 4.** No Spark 3, `.cast("date")` num texto inválido devolvia `NULL` sem avisar.
 # MAGIC No Spark 4 o **ANSI mode vem ligado**: o mesmo valor inválido **derruba o job**. Veja com os
-# MAGIC próprios olhos — `preco_raw` tem vírgula de milhar (`"11,105.8"`):
+# MAGIC próprios olhos — `data_raw` é o dia em segundos desde 1970 (`"1313625600"`), e a tentação é mandar
+# MAGIC um `cast` direto pra data:
 
 # COMMAND ----------
 
 try:
-    btc_sem_nulos_df.select(col("preco_raw").cast("double")).collect()
+    btc_sem_nulos_df.select(col("data_raw").cast("date")).collect()
 except Exception as erro:
     print(type(erro).__name__)
     print(str(erro).splitlines()[0])
@@ -171,35 +167,26 @@ else:
 
 # MAGIC %md
 # MAGIC O erro (`CAST_INVALID_INPUT`) diz qual valor quebrou e ainda sugere a saída: `try_cast`. Com ele,
-# MAGIC o que não converter vira `NULL` e a gente decide o que fazer. O mesmo vale pra data: `to_date()`
-# MAGIC sob ANSI também derruba o job num texto fora do formato; `try_to_timestamp(...).cast("date")`
-# MAGIC devolve `NULL`.
+# MAGIC o que não converter vira `NULL` e a gente decide o que fazer. Mas repare: aqui o `try_cast("date")`
+# MAGIC devolveria `NULL` nas 5.490 linhas. Ele **tolera** o valor que não converte; não adivinha o formato.
 # MAGIC
-# MAGIC Agora sim a limpeza pesada: tirar a vírgula de milhar de `preco_raw`/`abertura_raw`, traduzir o
-# MAGIC sufixo `K`/`M` de `volume_raw`, e transformar o texto de data em `date` de verdade.
+# MAGIC O caminho certo pro `timestamp` Unix tem dois passos: texto → número inteiro (`try_cast("bigint")`)
+# MAGIC e segundos → data e hora (`timestamp_seconds`). Daí pra `date` é um `cast` comum. Preço e volume
+# MAGIC são mais simples: o texto já está no formato de número, `try_cast("double")` resolve.
+# MAGIC
+# MAGIC A data sai certa porque a configuração lá em cima pôs a sessão em UTC, o mesmo relógio da API.
+# MAGIC Com a sessão no fuso de Brasília, meia-noite UTC seria 21h do dia anterior, e toda data sairia
+# MAGIC um dia antes.
 
 # COMMAND ----------
 
-from pyspark.sql.functions import regexp_replace, regexp_extract, try_to_timestamp, lit, year
+from pyspark.sql.functions import timestamp_seconds, year
 
 btc_convertido_df = (
-    btc_sem_nulos_df.withColumn(
-        "preco_usd", regexp_replace(col("preco_raw"), ",", "").try_cast("double")
-    )
-    .withColumn("abertura_usd", regexp_replace(col("abertura_raw"), ",", "").try_cast("double"))
-    .withColumn(
-        "volume",
-        when(
-            col("volume_raw").endswith("M"),
-            regexp_extract(col("volume_raw"), r"^([0-9.]+)", 1).try_cast("double") * 1_000_000,
-        )
-        .when(
-            col("volume_raw").endswith("K"),
-            regexp_extract(col("volume_raw"), r"^([0-9.]+)", 1).try_cast("double") * 1_000,
-        )
-        .otherwise(regexp_extract(col("volume_raw"), r"^([0-9.]+)", 1).try_cast("double")),
-    )
-    .withColumn("data", try_to_timestamp(col("data_raw"), lit("MMM dd, yyyy")).cast("date"))
+    btc_sem_nulos_df.withColumn("preco_usd", col("preco_raw").try_cast("double"))
+    .withColumn("abertura_usd", col("abertura_raw").try_cast("double"))
+    .withColumn("volume", col("volume_raw").try_cast("double"))
+    .withColumn("data", timestamp_seconds(col("data_raw").try_cast("bigint")).cast("date"))
     .withColumn("ano", year(col("data")))
     .filter(col("data").isNotNull() & col("preco_usd").isNotNull())  # descarta o que não converteu
 )
@@ -210,9 +197,11 @@ btc_convertido_df.select("data", "ano", "preco_usd", "abertura_usd", "volume").s
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC O filtro no fim não derrubou nenhuma linha a mais: depois de tirar a vírgula, todo preço converteu,
-# MAGIC e toda data estava no formato. Ainda assim o padrão fica — `try_cast` + filtro é o que protege o
-# MAGIC pipeline no dia em que um lote vier num formato diferente.
+# MAGIC O filtro no fim não derrubou nenhuma linha a mais: todo preço converteu e todo `timestamp` virou
+# MAGIC data. Ainda assim o padrão fica — `try_cast` + filtro é o que protege o pipeline no dia em que um
+# MAGIC lote vier num formato diferente.
+# MAGIC
+# MAGIC `volume` é a quantidade de **bitcoins** negociados no dia, não o valor em dólar.
 # MAGIC
 # MAGIC ## Exercício 5 — derive uma coluna: `fechou_em_alta`
 # MAGIC
@@ -257,7 +246,7 @@ from pyspark.sql.functions import mean, stddev, pandas_udf
 
 # Um Pandas UDF recebe LOTES (até 10.000 linhas por padrão, nunca mais que uma partição), não o
 # DataFrame inteiro. Calcular média/desvio DENTRO da função normalizaria cada lote pela própria
-# média. Aqui o dataset (3.663 linhas, 1 partição) cabe num lote só, então o erro nem apareceria —
+# média. Aqui o dataset (5.490 linhas, 1 partição) cabe num lote só, então o erro nem apareceria —
 # mas apareceria com mais dado ou mais partições. O certo: calcular as estatísticas globais ANTES,
 # com uma agregação normal, e passar por closure.
 stats = btc_categorizado_df.select(
@@ -295,7 +284,7 @@ btc_final_df.select("data", "preco_usd", "preco_zscore_udf", "preco_zscore").sho
 # MAGIC
 # MAGIC Pra caber numa cadeia só, o Z-score aqui usa window function (`mean(...).over(janela)`), que calcula
 # MAGIC a média global sem precisar de um `first()` no meio do caminho. Uma janela sem coluna de partição
-# MAGIC (`Window.partitionBy()` vazio) joga todas as linhas numa partição só — tudo bem pra 3.663 linhas,
+# MAGIC (`Window.partitionBy()` vazio) joga todas as linhas numa partição só — tudo bem pra 5.490 linhas,
 # MAGIC problema em dado grande.
 
 # COMMAND ----------
@@ -305,28 +294,17 @@ from pyspark.sql import Window
 janela_global = Window.partitionBy()
 
 bitcoin_limpo_df = (
-    spark.read.format("csv").option("header", "true").schema(schema).load(CAMINHO_CSV)
+    spark.read.format("json").schema(schema).load(CAMINHO_HISTORICO)
     .select(
-        col("Date").alias("data_raw"), col("Price").alias("preco_raw"),
-        col("Open").alias("abertura_raw"), col("`Vol.`").alias("volume_raw"),
+        col("timestamp").alias("data_raw"), col("close").alias("preco_raw"),
+        col("open").alias("abertura_raw"), col("volume").alias("volume_raw"),
     )
-    .withColumn("volume_raw", when(col("volume_raw") == "-", None).otherwise(col("volume_raw")))
+    .withColumn("volume_raw", when(col("volume_raw") == "0.00000000", None).otherwise(col("volume_raw")))
     .na.drop(subset=["volume_raw"])
-    .withColumn("preco_usd", regexp_replace(col("preco_raw"), ",", "").try_cast("double"))
-    .withColumn("abertura_usd", regexp_replace(col("abertura_raw"), ",", "").try_cast("double"))
-    .withColumn(
-        "volume",
-        when(
-            col("volume_raw").endswith("M"),
-            regexp_extract(col("volume_raw"), r"^([0-9.]+)", 1).try_cast("double") * 1_000_000,
-        )
-        .when(
-            col("volume_raw").endswith("K"),
-            regexp_extract(col("volume_raw"), r"^([0-9.]+)", 1).try_cast("double") * 1_000,
-        )
-        .otherwise(regexp_extract(col("volume_raw"), r"^([0-9.]+)", 1).try_cast("double")),
-    )
-    .withColumn("data", try_to_timestamp(col("data_raw"), lit("MMM dd, yyyy")).cast("date"))
+    .withColumn("preco_usd", col("preco_raw").try_cast("double"))
+    .withColumn("abertura_usd", col("abertura_raw").try_cast("double"))
+    .withColumn("volume", col("volume_raw").try_cast("double"))
+    .withColumn("data", timestamp_seconds(col("data_raw").try_cast("bigint")).cast("date"))
     .withColumn("ano", year(col("data")))
     .filter(col("data").isNotNull() & col("preco_usd").isNotNull())
     .withColumn("fechou_em_alta", when(col("preco_usd") > col("abertura_usd"), True).otherwise(False))

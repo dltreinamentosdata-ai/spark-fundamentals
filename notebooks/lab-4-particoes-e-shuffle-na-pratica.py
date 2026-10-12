@@ -48,7 +48,7 @@ print("Cores disponíveis no cluster:", spark.sparkContext.defaultParallelism)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Anote os dois números. A tabela é pequena (3.663 linhas, um arquivo só), então é **1 partição** —
+# MAGIC Anote os dois números. A tabela é pequena (5.490 linhas, um arquivo só), então é **1 partição** —
 # MAGIC e 1 partição = 1 task: por mais cores que o cluster tenha, só um trabalha nessa leitura. É o
 # MAGIC cenário "menos partições que cores" da aula 4.2, ao vivo.
 # MAGIC
@@ -175,7 +175,7 @@ print(f"Cores: {cores} | alvo (3x): {particoes_alvo} | partições agora: {df_di
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC A conta fecha: 3 × cores. Agora a pergunta honesta: **valeu a pena** reparticionar 3.663 linhas?
+# MAGIC A conta fecha: 3 × cores. Agora a pergunta honesta: **valeu a pena** reparticionar 5.490 linhas?
 # MAGIC Não. O `repartition` é um shuffle, e num dataset desse tamanho o shuffle custa mais do que o
 # MAGIC paralelismo devolve. A régua de 2 a 3 tasks por core é pra dado que ocupa o cluster — aqui o
 # MAGIC objetivo foi só ver o número de partições obedecer à conta.
